@@ -2,11 +2,9 @@ import re
 import csv
 import time
 import json
-import requests
 from datetime import datetime
 from collections import OrderedDict
 from urllib.parse import urlparse
-
 
 import scrapy
 
@@ -15,7 +13,8 @@ def write_to_csv(filename, mode, row_data):
     with open(filename, mode,
               encoding='utf-8', newline = '\n') as f:
         writer = csv.writer(f)
-        writer.writerow(row_data)
+        for data in row_data:
+            writer.writerow(data)
 
 
 class EbaySpider(scrapy.Spider):
@@ -23,48 +22,55 @@ class EbaySpider(scrapy.Spider):
     start_urls = ['https://www.google.com']
     base_url = 'https://www.ebay.co.uk/itm/'
     shipping_fee_url = base_url+'getrates?item={}&_trksid=&quantity=&country=3&co=0&cb=&_='
+    output_filename = 'output/eBay Stock Levels(parent).csv'
 
-    input_filename = f'output/{datetime.now().strftime("%m-%d-%y")}.csv'
+    csv_headers = [['Product Code', 'Item Cost',
+                    'Shipping Cost','Total Stock',
+                    'Status', 'repricer_name']]
+    rows_data = []
 
-    handle_httpstatus_list = [400, 401, 402, 403, 404, 405,
-                              406, 407, 409, 500, 501, 502,
-                              503, 504, 505, 506, 507, 509]
-    csv_headers = ['Product Code', 'Item Cost', 'Total Stock',
-                   'Status', 'Shipping Cost']
+    custom_settings = {
+        'CONCURRENT_REQUESTS': '32',
+    }
 
     trim_cost = re.compile(r'[^\d.,]+')
 
-    def __init__(self):
-        with open('input/eBay Inventory.csv', 'r') as file:
-            self.sku_list = [x['sku'] for x in csv.DictReader(file)]
+    @classmethod
+    def from_crawler(cls, crawler, *args, **kwargs):
+        spider = super(EbaySpider, cls).from_crawler(crawler, *args, **kwargs)
+        crawler.signals.connect(spider.spider_idle, scrapy.signals.spider_idle)
+        return spider
 
-    # @classmethod
-    # def from_crawler(cls, crawler, *args, **kwargs):
-    #     spider = super(EbaySpider, cls).from_crawler(crawler, *args, **kwargs)
-    #     crawler.signals.connect(spider.spider_idle, scrapy.signals.spider_idle)
-    #     return spider
-    #
-    # def spider_idle(self, spider):
-    #     print('*****************wait for 30 sec..')
-    #     time.sleep(30)
-    #     req = scrapy.Request(url=self.start_urls[0], callback=self.parse, dont_filter=True)
-    #     self.crawler.engine.crawl(req, spider)
+    def spider_idle(self, spider):
+        self.logger.info('Writing data to csv')
+        write_to_csv(self.output_filename, 'a', self.rows_data)
+
+    def __init__(self):
+        print('in init')
+        with open('input/eBay Inventory.csv', 'r') as file:
+            self.csv_rows = [x for x in csv.DictReader(file)]
 
     def parse(self, response):
         #write headers
-        write_to_csv(self.input_filename, 'w', self.csv_headers)
+        write_to_csv(self.output_filename, 'w', self.csv_headers)
 
-        for sku in self.sku_list[1:10]:
+        for csv_row in self.csv_rows[1:]:
+            sku = csv_row.get('sku')
+            repricer_name = csv_row.get('repricer_name')
+
             url = self.base_url + sku.replace('FLEA ', '')
             yield scrapy.Request(url,
                                  dont_filter=True,
                                  callback=self.parse_product,
-                                 meta={'product_code': sku}
+                                 meta={'product_code': sku,
+                                       'repricer_name': repricer_name}
                                  )
 
 
     def parse_product(self, response):
+        print('code ',response.status)
         item = OrderedDict()
+        repricer_name = response.meta['repricer_name']
         item['Product Code'] = response.meta['product_code']
         query = urlparse(response.url).query
 
@@ -76,16 +82,16 @@ class EbaySpider(scrapy.Spider):
             item['Total Stock'] = 0
             item['Status'] = 'Product not found!'
             item['Shipping Cost'] = 0
+            item['repricer_name'] = repricer_name
 
-            row_data = [item['Product Code'], item['Item Cost'], item['Total Stock'],
-                        item['Status'], item['Shipping Cost']]
-
-            self.logger.info('writting item: ',item)
-            write_to_csv(self.input_filename, 'a', row_data)
+            row_data = [item.get('Product Code'), item.get('Item Cost'),
+                        item.get('Shipping Cost'),item.get('Total Stock'),
+                        item.get('Status'), item.get('repricer_name')]
+            self.rows_data.append(row_data)
         else:
-            yield self.get_product_details(response, item)
+            yield self.get_product_details(response, item, repricer_name )
 
-    def get_product_details(self, response, item):
+    def get_product_details(self, response, item, repricer_name ):
         item['Item Cost'] = response.css('span[itemprop="price"]::text').get(0)
 
         if item['Item Cost']:
@@ -99,7 +105,6 @@ class EbaySpider(scrapy.Spider):
         else:
             status_msg = response.css('span#qtySubTxt'
                                       ' span::text').get('').strip()
-
             # check is the numeric value (stock) exists in status_msg
             total_stock = re.findall(r'[0-9]+',
                                      status_msg)
@@ -117,19 +122,29 @@ class EbaySpider(scrapy.Spider):
                     item['Total Stock'] = 0
                     item['Status'] = 'click & collect only'
 
-        #get shipping fee by making get request
+        #get shipping fee by making request
         sku = item['Product Code'].replace('FLEA ', '')
-        shipping_response = requests.get(self.shipping_fee_url.format(sku))
-        shipping_response = json.loads(shipping_response.text)
-        shipping_response = scrapy.Selector(text=shipping_response['shippingSummary'])
-        item['Shipping Cost'] = shipping_response.css('span#fshippingCost span::text').get(0)
-        if item['Shipping Cost'] == 'Free':
+        item['repricer_name'] = repricer_name
+
+        return scrapy.Request(self.shipping_fee_url.format(sku),
+                             callback=self.get_shipping_fee,
+                             meta={'item': item})
+
+    def get_shipping_fee(self,response):
+        item = response.meta['item']
+
+        shipping_response = json.loads(response.text).get('shippingSummary')\
+                            or ''
+        shipping_response = scrapy.Selector(text=shipping_response)
+        item['Shipping Cost'] = shipping_response.css('span#fshippingCost span::text').get('')
+
+        item['Shipping Cost'] = self.trim_cost.sub('', item['Shipping Cost'])
+        if item['Shipping Cost'] == '':
             item['Shipping Cost'] = 0
 
-        row_data = [item['Product Code'], item['Item Cost'], item['Total Stock'],
-                    item['Status'], item['Shipping Cost']]
+        row_data = [item.get('Product Code'), item.get('Item Cost'),
+                    item.get('Shipping Cost'), item.get('Total Stock'),
+                    item.get('Status'), item.get('repricer_name')]
 
-        self.logger.info('Writing item: ',item)
-        write_to_csv(self.input_filename, 'a', row_data)
-
+        self.rows_data.append(row_data)
 
